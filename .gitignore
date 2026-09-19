@@ -32,3 +32,5 @@ STOP
 .env
 .env.*
 !.env.example
+/files.txt
+/pytest_report.txt

@@ -289,12 +289,22 @@ def _audit_source(
                 counts[key] = counts.get(key, 0) + 1
                 assert key in allowed_create and counts[key] <= allowed_create[key]
             elif (
-                qualified in {
-                    "os.remove", "os.unlink", "os.rename", "os.replace", "os.rmdir", "os.truncate",
-                    "os.link", "os.symlink", "os.chmod", "os.utime",
+                qualified
+                in {
+                    "os.remove",
+                    "os.unlink",
+                    "os.rename",
+                    "os.replace",
+                    "os.rmdir",
+                    "os.truncate",
+                    "os.link",
+                    "os.symlink",
+                    "os.chmod",
+                    "os.utime",
                 }
                 or base == "os"
-                and attr in {
+                and attr
+                in {
                     "remove",
                     "unlink",
                     "rename",
@@ -319,7 +329,7 @@ def _audit_source(
                 counts[key] = counts.get(key, 0) + 1
                 assert key in allowed_destructive and counts[key] <= allowed_destructive[key]
             if (isinstance(node.func, ast.Name) and node.func.id == "open") or (
-                isinstance(node.func, ast.Attribute) and attr == "open"
+                isinstance(node.func, ast.Attribute) and attr == "open" and base not in {"Image", "ImageFile"}
             ):
                 mode = (
                     node.args[1]
@@ -332,8 +342,7 @@ def _audit_source(
                     counts[key] = counts.get(key, 0) + 1
                     assert key in allowed_create and counts[key] <= allowed_create[key]
             if (
-                isinstance(node.func, ast.Name)
-                and node.func.id in {"eval", "exec", "__import__"}
+                isinstance(node.func, ast.Name) and node.func.id in {"eval", "exec", "__import__"}
             ) or qualified.startswith(("subprocess.", "os.system", "os.popen", "os.exec", "os.spawn")):
                 raise AssertionError("dynamic execution/import")
             if (
@@ -359,7 +368,12 @@ def _audit_source(
 def test_static_safety_audit_and_self_tests() -> None:
     root = Path(__file__).parents[1] / "src"
     destructive = {("safety.py", "cleanup_partial"): 1}
-    create = {("db.py", "acquire"): 1, ("db.py", "open_database"): 1}
+    create = {
+        ("db.py", "acquire"): 1,
+        ("db.py", "open_database"): 1,
+        ("reporting.py", "_write_exclusive"): 2,
+        ("reporting.py", "write_reports"): 2,
+    }
     for path in root.rglob("*.py"):
         source = path.read_text(encoding="utf-8")
         _audit_source(

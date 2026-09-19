@@ -155,6 +155,138 @@ def _migrate(connection: sqlite3.Connection, input_root: Path) -> None:
         raise MigrationError(f"unsupported schema version {version}; use new_db=True")
     if version == 0:
         _create_schema(connection, input_root)
+    _migrate_m2(connection)
+
+
+def _migrate_m2(connection: sqlite3.Connection) -> None:
+    """Upgrade the M1 tables in one transaction without replacing existing values."""
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(media)")}
+        additions = {
+            "extension": "TEXT",
+            "detected_format": "TEXT",
+            "width": "INTEGER",
+            "height": "INTEGER",
+            "frame_count": "INTEGER",
+            "warnings": "TEXT",
+            "metadata_path": "TEXT",
+            "match_method": "TEXT",
+            "match_confidence": "TEXT",
+            "match_reason": "TEXT",
+            "meta_title": "TEXT",
+            "meta_description": "TEXT",
+            "photo_taken_at": "TEXT",
+            "creation_time": "TEXT",
+            "modification_time": "TEXT",
+            "meta_url": "TEXT",
+            "meta_origin": "TEXT",
+            "raw_metadata_json": "TEXT",
+            "source_present": "INTEGER NOT NULL DEFAULT 1",
+            "verification_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "verified_at": "TEXT",
+        }
+        for name, kind in additions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE media ADD COLUMN {name} {kind}")  # noqa: S608
+        connection.execute(
+            """CREATE TRIGGER IF NOT EXISTS media_metadata_status_check
+               BEFORE UPDATE OF metadata_status ON media
+               WHEN NEW.metadata_status IS NOT NULL AND NEW.metadata_status NOT IN
+               ('MATCHED','UNMATCHED','AMBIGUOUS','INVALID_JSON','NULL')
+               BEGIN SELECT RAISE(ABORT, 'invalid metadata_status'); END"""
+        )
+        connection.execute(
+            """CREATE TRIGGER IF NOT EXISTS media_metadata_status_insert_check
+               BEFORE INSERT ON media
+               WHEN NEW.metadata_status IS NOT NULL AND NEW.metadata_status NOT IN
+               ('MATCHED','UNMATCHED','AMBIGUOUS','INVALID_JSON','NULL')
+               BEGIN SELECT RAISE(ABORT, 'invalid metadata_status'); END"""
+        )
+        old_unsupported = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='unsupported_files'"
+        ).fetchone()
+        old_columns: set[str] = set()
+        legacy_unsupported = False
+        if old_unsupported is not None:
+            old_columns = {row[1] for row in connection.execute("PRAGMA table_info(unsupported_files)")}
+            if "relative_path" not in old_columns:
+                legacy_unsupported = True
+                connection.execute("ALTER TABLE unsupported_files RENAME TO unsupported_files_v1")
+        if old_unsupported is None or legacy_unsupported:
+            connection.execute("DROP TABLE IF EXISTS unsupported_files")
+            connection.execute(
+                """CREATE TABLE unsupported_files (
+                    relative_path TEXT PRIMARY KEY,
+                    extension TEXT NOT NULL,
+                    category TEXT NOT NULL CHECK(category IN ('HASH_ONLY','UNSUPPORTED')),
+                    size INTEGER NOT NULL,
+                    sha256 TEXT,
+                    reason TEXT,
+                    source_present INTEGER NOT NULL DEFAULT 1 CHECK(source_present IN (0,1))
+                )"""
+            )
+        if legacy_unsupported:
+            connection.execute(
+                """INSERT INTO unsupported_files(relative_path,extension,category,size,sha256,source_present)
+                   SELECT path, '', 'UNSUPPORTED', size, sha256, 1 FROM unsupported_files_v1"""
+            )
+            connection.execute("DROP TABLE unsupported_files_v1")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS json_files (
+                relative_path TEXT PRIMARY KEY,
+                size INTEGER NOT NULL,
+                sha256 TEXT,
+                kind TEXT NOT NULL CHECK(kind IN ('MEDIA_METADATA','NON_MEDIA_JSON','INVALID_JSON')),
+                claimed_by_count INTEGER NOT NULL DEFAULT 0,
+                source_present INTEGER NOT NULL DEFAULT 1 CHECK(source_present IN (0,1))
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS skipped_entries (
+                run_id TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                PRIMARY KEY(run_id, relative_path)
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS duplicate_groups (
+                sha256 TEXT PRIMARY KEY,
+                file_count INTEGER NOT NULL,
+                scope TEXT NOT NULL
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS duplicate_members (
+                sha256 TEXT NOT NULL,
+                path TEXT NOT NULL,
+                PRIMARY KEY(sha256, path)
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS runs (
+                run_id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                completed_at TEXT,
+                status TEXT NOT NULL,
+                configuration TEXT NOT NULL,
+                counts TEXT,
+                error TEXT
+            )"""
+        )
+        connection.execute("DROP VIEW IF EXISTS orphan_json")
+        connection.execute(
+            """CREATE VIEW orphan_json AS
+               SELECT relative_path, size, sha256, kind, claimed_by_count, source_present
+               FROM json_files WHERE kind='MEDIA_METADATA' AND claimed_by_count=0"""
+        )
+        connection.execute(f"PRAGMA user_version = {CURRENT_SCHEMA}")
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
 
 
 def open_database(
@@ -186,7 +318,10 @@ def open_database(
             stored = connection.execute("SELECT input_root FROM meta LIMIT 1").fetchone()
             if stored is None or _root_key(stored[0]) != root:
                 raise DatabaseError("input root differs from database; use new_db=True")
-            if int(connection.execute("PRAGMA user_version").fetchone()[0]) != CURRENT_SCHEMA:
+            has_m2 = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='json_files'"
+            ).fetchone()
+            if int(connection.execute("PRAGMA user_version").fetchone()[0]) != CURRENT_SCHEMA or has_m2 is None:
                 _migrate(connection, root)
         if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise DatabaseError("SQLite quick_check failed")
@@ -277,4 +412,27 @@ def mark_hash_changed(connection: sqlite3.Connection, media_id: int) -> None:
             """UPDATE media SET stage='DISCOVERED', reason='FILE_CHANGED_DURING_HASH',
                verification_attempts=verification_attempts+1 WHERE media_id=?""",
             (media_id,),
+        )
+
+
+def start_run(connection: sqlite3.Connection, run_id: str, configuration: str) -> None:
+    with transaction(connection):
+        connection.execute(
+            "INSERT INTO runs(run_id,started_at,status,configuration) VALUES (?,?,?,?)",
+            (run_id, _utc_now(), "RUNNING", configuration),
+        )
+
+
+def finish_run(connection: sqlite3.Connection, run_id: str, status: str, counts: str, error: str | None = None) -> None:
+    with transaction(connection):
+        connection.execute(
+            "UPDATE runs SET completed_at=?, status=?, counts=?, error=? WHERE run_id=?",
+            (_utc_now(), status, counts, error, run_id),
+        )
+
+
+def reset_stuck(connection: sqlite3.Connection) -> None:
+    with transaction(connection):
+        connection.execute(
+            "UPDATE media SET stage='DISCOVERED', verification_status='PENDING' WHERE stage IN ('HASHING','VERIFYING')"
         )

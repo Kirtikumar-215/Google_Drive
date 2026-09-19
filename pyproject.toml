@@ -6,10 +6,14 @@ build-backend = "setuptools.build_meta"
 name = "google-photo-manager"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["Pillow>=10"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6", "mypy>=1.11"]
+heif = ["pillow-heif>=0.16"]
+
+[project.scripts]
+google-photo-manager = "archive_verifier.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
