@@ -9,7 +9,10 @@ compare-and-set stage transitions.
 Run the M1 tests with:
 
 ```text
+python -m pip install -e ".[dev]"
 python -m pytest -q
+python -m ruff check src tests
+python -m mypy src
 ```
 
 This repository intentionally stops at M1. Metadata matching, media
